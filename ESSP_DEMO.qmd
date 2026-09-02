@@ -1,0 +1,191 @@
+---
+title: "The ESSP Package"
+subtitle: "A plain-English pipeline for U.S. energy data"
+author: "Energy Security Studies Program"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-location: left
+    number-sections: true
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+    # Match showtext's registration dpi (register_merriweather sets dpi=300),
+    # or the Merriweather glyphs render at the wrong physical size.
+    fig-dpi: 300
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(ESSP)
+library(knitr)
+options(digits = 4)
+```
+
+# What this is
+
+`ESSP` is an in-house R package for energy research. It wraps the U.S. Energy Information Administration (EIA) data API behind a small set of plain-English commands, so a student can go from a question to a finished, house-styled chart without touching a URL, an API key, or a raw data file.
+
+Everything below is **live**: each table and figure on this page was pulled straight from EIA when this document was rendered. Nothing is pasted in.
+
+The package is organized around three ideas:
+
+1.  **Get** — `essp.get()`, downloadsmost questions.
+2.  **Analyze** — `analyze.*` commands return tidy, analysis-ready tables.
+3.  **Chart** — `chart.*` commands draw the program's signature figures.
+
+A student never has to know whether a topic is keyed by state or by grid operator, or how EIA formats its dates — the commands take ordinary strings.
+
+# Downloading Raw Data: `essp.get()`
+
+`essp.catalog()` lists every topic that you can "get", and whether it expects a **state**, a **balancing authority** (grid operator), or a **fuel**.
+
+```{r}
+#| label: catalog
+# One call lists the whole vocabulary -- no manual to read.
+kable(essp.catalog(), caption = "Everything essp.get() can fetch")
+```
+
+With that, a single line answers a question. `what` decides how `where` is read, so the student doesn't have to:
+
+```{r}
+#| label: get-demo
+# "Give me Georgia's generation mix for 2024."
+essp.get("mix", "GA", "2024") |> head(8) |>
+  kable(digits = 1, caption = "essp.get('mix', 'GA', '2024')")
+```
+
+# Analysis tables
+
+The `analyze.*` commands are the engine behind `essp.get()`. Each takes the same simple `(state, year)` form, fills in sensible defaults, and returns a tidy table you can read, export, or feed to a chart.
+
+## Generation vs. capacity mix
+
+This is the base generation and capacity analysis command.
+
+```{r}
+#| label: mix-table
+# The national picture for 2024. `solar = "total"` counts small rooftop solar.
+mix_us <- analyze.mix("US", "2024")
+kable(mix_us, digits = 1,
+      caption = "U.S. capacity and generation by resource, 2024")
+```
+
+## Fuel diversity across states, in one call
+
+Because every metric now accepts **several states at once**, a comparison that used to need a loop is a single line. Here we score three states on how concentrated their power mix is.
+
+I am going to add various calculation functions such as the **HHI** (Herfindahl–Hirschman Index), as we used for wallet-share and other insight reports. The HHI is the standard measure of concentration: add up the square of each fuel's percentage share of the mix. It runs from near 0 (many fuels, evenly balanced) to 10,000 (a single fuel supplies everything). A higher HHI means more dependence on one fuel.
+
+```{r}
+#| label: diversity-multi
+# Three states, stacked into one table with a `state` column.
+analyze.diversity("GA,WV,CA", "2024") |>
+  kable(digits = 1,
+        caption = "Fuel-mix concentration: GA vs. WV vs. CA, 2024")
+```
+
+Use case: West Virginia, running almost entirely on coal, scores as the most concentrated; California, with a broad renewable mix, the least.
+
+## Use case: Who's the leading producer of X?
+
+`analyze.fuelleaders()` answers "which states produce the most of X?" with the cumulative share carried alongside, so a claim like *"the top 8 states account for N% of U.S. solar"* writes itself from the table.
+
+```{r}
+#| label: fuelleaders
+analyze.fuelleaders("Solar", "2024", n = 8) |>
+  kable(digits = 1, caption = "Top solar-generating states, 2024")
+```
+
+# Charts
+
+The `chart.*` commands render the program's house figures. They accept the same plain strings — fetch and draw happen in one call.
+
+## Capacity vs. generation
+
+`chart.generation()` is the signature 0–100% stacked bar. Passing a resource name highlights it and greys the rest, keeping the house colors consistent across every figure.
+
+```{r}
+#| label: chart-generation
+#| fig-cap: "U.S. fleet makeup, solar highlighted (chart.generation)."
+chart.generation("Solar", "US", "2024")
+```
+
+## The daily demand curve
+
+`chart.demandcurve()` builds the stacked daily generation profile for a grid operator — here California (CISO), averaged across a summer day. It runs the whole pipeline (hourly fuel mix, the natural-gas split into baseload and peakers, and battery storage) behind a single call.
+
+```{r}
+#| label: chart-demand
+#| fig-cap: "CISO summer demand curve, Solar and NGCT highlighted (chart.demandcurve)."
+#| fig-width: 11
+#| fig-height: 6
+chart.demandcurve("Solar,NGCT", "CISO", "2024")
+```
+
+::: callout-note
+## A note on batteries in the live data
+
+EIA's hourly grid-monitor feed does not report battery storage as a fuel type, so a curve built strictly from live data shows no storage band, the real `BAT (Battery)` series is unavailable for every region we pull.\
+\
+The reference script that inspired this chart drew a storage band, but it did so from a *modeled* (synthetic) storage profile rather than measured hourly output.
+
+The original R script imputes a cosine wave:\
+\
+bump \<- function(h, center, halfwidth, peak) { out \<- numeric(length(h)) win \<- abs(h - center) \< halfwidth out\[win\] \<- peak \* 0.5 \* (1 + cos(pi \* (h\[win\] - center) / halfwidth)) out }\
+\
+Should I impute this as well and make a note that battery storage isn't lined to data?
+:::
+
+# Normative Time and State
+
+**Normative time.** The hourly commands take ordinary time phrases, so nobody types an ISO timestamp:
+
+```{r}
+#| label: normative-time
+# "Give me CISO's average demand profile for July 2024."
+analyze.loadshape("CISO", "July 2024") |> head(6) |>
+  kable(digits = 0, caption = "analyze.loadshape('CISO', 'July 2024')")
+```
+
+The same command scales up without changing shape — ask for several states and years and it stacks them, keeping `state` and `year` columns so the result stays self-describing:
+
+```{r}
+#| label: multi
+analyze.capacityfactor("GA,OH", "2023,2024") |>
+  kable(digits = 1,
+        caption = "Capacity factor by resource: 2 states x 2 years")
+```
+
+# In short
+
+A student loads the package and asks questions in plain English:
+
+``` r
+library(ESSP)
+essp.get("mix", "GA", "2024")          # a table
+chart.generation("Solar", "US", "2024") # a figure
+chart.demandcurve("Solar", "CISO", "2024")
+```
+
+Every number and figure above came from EIA at render time, through those same commands — reproducible, citable, and in the program's house style.
+
+# Future Ideas:
+
+::: {.callout-tip appearance="minimal"}
+## 1. an essp.print() command that outputs the code for various figures and tables and plots, in case someone wants access to the backend
+
+2.  essp.write() command that writes excel files and csvs
+3.  Plain-language explinations for errors, when stuff is downloading, possible inline embedded AI assistant -- new package tool i found
+4.  Quarto-playground similar to canva that allows students to make reports without needing to actually code anything.
+5.  Publish to C-RAN eventually under MIT open access license.
+:::

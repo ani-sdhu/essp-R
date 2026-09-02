@@ -1,0 +1,9 @@
+^ESSP_DEMO\.qmd$
+^ESSP_DEMO\.html$
+^ESSP_DEMO_files$
+^docs$
+^_check$
+^test\.r$
+^ESSP\.Rproj$
+^\.Rproj\.user$
+^README\.md$
