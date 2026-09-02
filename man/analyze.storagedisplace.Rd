@@ -4,11 +4,7 @@
 \alias{analyze.storagedisplace}
 \title{Insert battery discharge into the dispatch stack}
 \usage{
-analyze.storagedisplace(
-  data,
-  storage,
-  displaces = c("NG Peakers", "NGCT", "NGCC", "NG")
-)
+analyze.storagedisplace(data, storage, displaces = c("NGCT", "NGCC", "NG"))
 }
 \arguments{
 \item{data}{Hourly fuel shape, as from \code{\link[=analyze.fuelshape]{analyze.fuelshape()}}.}

@@ -21,11 +21,13 @@ Sys.setenv(GITHUB_PAT = "ghp_xxx")   # a PAT with access to ani-sdhu/essp-R
 pak::pak("ani-sdhu/essp-R")
 ```
 
-You also need an EIA API key (free from <https://www.eia.gov/opendata/>) in
-`EIA_KEY` (or `EIA_API_KEY`):
+You also need an EIA API key (free from <https://www.eia.gov/opendata/>). Set it
+once — `essp.key()` saves it to `~/.Renviron`, so future sessions pick it up
+automatically:
 
 ```r
-Sys.setenv(EIA_KEY = "your-eia-key")   # best set once in ~/.Renviron
+library(ESSP)
+essp.key("your-eia-key")   # sets it now and remembers it; essp.key() checks status
 ```
 
 ## Use
