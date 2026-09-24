@@ -75,6 +75,7 @@ chart.demandcurve <- function(data,
                               label_min      = 4,
                               semester       = "Fall",
                               storage_ba     = NULL,
+                              storage        = "auto",
                               year           = as.integer(format(Sys.Date(), "%Y"))) {
   # String front door: chart.demandcurve("Solar", "CISO", "2024", "summer").
   # A character first argument is the highlight tech, and the next positionals
@@ -82,8 +83,8 @@ chart.demandcurve <- function(data,
   if (is.character(data) && !is.data.frame(data)) {
     return(essp_demandcurve_strings(
       tech = data, ba = highlight, year = order, season = bands %||% "summer",
-      storage_ba = storage_ba, smooth = smooth, palette = palette,
-      semester = semester))
+      storage_ba = storage_ba, storage = storage, smooth = smooth,
+      palette = palette, semester = semester))
   }
 
   for (cl in c("hour", "fueltype", "mean_mw")) {
@@ -223,20 +224,15 @@ chart.demandcurve <- function(data,
   labs <- labs[labs$value > 0, , drop = FALSE]
   # A size-4.5 label occupies roughly 4.5% of the panel height.
   text_h <- ymax_axis * 0.045
+  # Remember each band's true anchor before any nudging: the label may be pushed
+  # off its slab to avoid a collision, and a leader has to point back to where
+  # the band actually is, not to the shifted label.
+  labs$bx  <- labs$hour        # anchor hour, on the band
+  labs$by0 <- labs$ymid        # anchor height, centre of the band
   labs$outside <- labs$value < text_h
 
-  # Several very thin bands stack up near the peak, so their leader labels land
-  # on top of one another. Walk them in vertical order and push each clear of
-  # the one below.
-  if (any(labs$outside)) {
-    oi <- which(labs$outside)
-    oi <- oi[order(labs$ymid[oi])]
-    for (k in seq_along(oi)[-1]) {
-      gap <- labs$ymid[oi[k]] - labs$ymid[oi[k - 1]]
-      if (gap < text_h) labs$ymid[oi[k]] <- labs$ymid[oi[k - 1]] + text_h
-    }
-  }
-  # Nudge any inside label that would land on a threshold rule.
+  # Nudge any inside label that would land on a threshold rule first, so the
+  # de-collision below settles on the final positions.
   if (!is.null(bands)) {
     for (b in unname(bands)) {
       hit <- !labs$outside & abs(labs$ymid - b) < text_h * 0.6
@@ -244,11 +240,45 @@ chart.demandcurve <- function(data,
         ifelse(labs$ymid[hit] >= b, 1, -1) * text_h * 0.75
     }
   }
+
+  # De-collide EVERY label vertically, not just the thin outside ones. On grids
+  # with many small evening bands (NGCT, Other, Hydro, Wind, Storage all peaking
+  # together) the inside labels pile into the top-right corner too. Walk bottom
+  # to top pushing each clear, then, if that runs past the top of the panel,
+  # walk back down from a capped top so nothing is shoved off the axis.
+  g <- text_h * 1.08
+  ord <- order(labs$ymid)
+  for (k in seq_along(ord)[-1]) {
+    if (labs$ymid[ord[k]] - labs$ymid[ord[k - 1]] < g)
+      labs$ymid[ord[k]] <- labs$ymid[ord[k - 1]] + g
+  }
+  cap <- ymax_axis - text_h * 0.6
+  top <- ord[length(ord)]
+  if (labs$ymid[top] > cap) {
+    labs$ymid[top] <- cap
+    for (k in rev(seq_along(ord))[-1]) {
+      if (labs$ymid[ord[k + 1]] - labs$ymid[ord[k]] < g)
+        labs$ymid[ord[k]] <- labs$ymid[ord[k + 1]] - g
+    }
+  }
+
+  # Only a label the de-collision actually pushed off its slab gets a leader
+  # back to the band centre; a thin band whose label still sits on it needs no
+  # connector (a stub floating beside an on-band label just looks like noise).
+  labs$lead <- abs(labs$ymid - labs$by0) > text_h * 0.55
+  # Thin slabs and floated labels take the smaller ink type, as the house figure
+  # sets Hydro and Storage; thick bands keep the large fuel-coloured label.
+  labs$small <- labs$outside | labs$lead
+
   labs$colour <- essp.textcolor(unname(fills[as.character(labs$fueltype)]))
   labs$face <- ifelse(as.character(labs$fueltype) %in% bold, "bold",
                       ifelse(as.character(labs$fueltype) %in% italic, "italic", "plain"))
-  # Keep labels near the day's edges inside the panel.
-  labs$hjust <- ifelse(labs$hour <= 1.5, 0, ifelse(labs$hour >= 21.0, 1, 0.5))
+  # Alignment keeps every label inside the panel: left-anchored at the start of
+  # the day, right-anchored near its end (the text then grows leftward, away
+  # from the axis), centred in between. The right-anchored x is pinned just
+  # inside the panel so even a label anchored at the far edge cannot clip.
+  labs$hjust <- ifelse(labs$bx <= 1.5, 0, ifelse(labs$bx >= 16.5, 1, 0.5))
+  labs$tx <- ifelse(labs$hjust == 1, pmin(labs$bx, hmax - 0.2), labs$bx)
 
   # The peak marker's label sits above the peak, so the axis has to leave
   # room for it -- otherwise ggplot drops the annotation outside the scale
@@ -321,23 +351,52 @@ chart.demandcurve <- function(data,
     }
   }
 
-  # The storage discharge band is a thin slab at the evening peak -- too thin
-  # to hold text -- so it gets an outside label with a leader, as in the house
-  # figure. Charging keeps its label inside, where there is room.
+  # Storage discharge is a thin slab at the crest. Label it just above the peak
+  # with a short leader onto the sliver, the way the house figure does -- kept
+  # separate from the Hydro/Other column so neither crowds the other.
   st <- labs[as.character(labs$fueltype) %in% c("Storage", "BAT"), , drop = FALSE]
   if (nrow(st)) {
     labs <- labs[!as.character(labs$fueltype) %in% c("Storage", "BAT"), , drop = FALSE]
-    sx <- st$hour[1]; sy <- st$ymid[1]
+    sx <- st$bx[1]; sy <- st$by0[1]
     p <- p +
-      ggplot2::annotate("text", x = min(sx + 2.0, 23.4), y = sy + ymax_axis * 0.11,
-                        label = "Storage", size = 3.2, hjust = 0.5,
-                        colour = essp.colors("ink")) +
-      ggplot2::annotate("segment",
-                        x = min(sx + 1.8, 23.2), xend = sx + 0.15,
+      ggplot2::annotate("segment", x = min(sx + 1.8, 22.4), xend = sx + 0.1,
                         y = sy + ymax_axis * 0.085, yend = sy + ymax_axis * 0.008,
-                        arrow = ggplot2::arrow(length = ggplot2::unit(0.2, "cm"),
+                        arrow = ggplot2::arrow(length = ggplot2::unit(0.18, "cm"),
                                                type = "closed"),
-                        colour = "black", linewidth = 0.5)
+                        colour = "black", linewidth = 0.45) +
+      ggplot2::annotate("text", x = min(sx + 2.0, 22.6), y = sy + ymax_axis * 0.105,
+                        label = "Storage", size = 3.2, hjust = 0.5,
+                        colour = essp.colors("ink"))
+  }
+
+  # Hydro (WAT) and Other (OTH) fan into thin ribbons along the evening shoulder;
+  # in greyscale their on-band labels can't be told apart. Stack them in a
+  # right-anchored column in the open wedge above the DESCENDING shoulder, kept
+  # clear of whatever on-band label shares the right corner (chiefly NGCT), and
+  # lead each back to its band. Right-anchored so the text grows leftward and
+  # can't clip the panel edge; the higher band's label sits on top so the two
+  # leaders fan without crossing.
+  ho <- labs[as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
+  if (nrow(ho)) {
+    labs <- labs[!as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
+    ho   <- ho[order(-ho$by0), , drop = FALSE]      # higher band's label on top
+    n    <- nrow(ho)
+    colx <- hmax - 0.2                              # right-anchored, just inside the panel
+    top  <- (if (!is.null(reserve_margin)) min(reserve_margin) else ymax_axis) - text_h * 0.7
+    corner <- labs[labs$tx > colx - 3.5, , drop = FALSE]   # on-band labels in the right corner
+    floor  <- if (nrow(corner)) max(corner$ymid) + text_h * 1.2 else top - text_h
+    gy   <- if (n > 1) max(text_h * 1.15, min(text_h * 1.4, (top - floor) / (n - 1))) else 0
+    ho$ly <- top - (seq_len(n) - 1L) * gy
+    for (i in seq_len(n)) {
+      p <- p +
+        ggplot2::annotate("segment", x = colx - 0.25, xend = ho$bx[i],
+                          y = ho$ly[i] - text_h * 0.45, yend = ho$by0[i] + text_h * 0.15,
+                          arrow = ggplot2::arrow(length = ggplot2::unit(0.15, "cm"),
+                                                 type = "closed"),
+                          colour = "black", linewidth = 0.35) +
+        ggplot2::annotate("text", x = colx, y = ho$ly[i], label = ho$label[i],
+                          size = 3.2, hjust = 1, colour = essp.colors("ink"))
+    }
   }
 
   if (isTRUE(mark_peak)) {
@@ -365,25 +424,31 @@ chart.demandcurve <- function(data,
                         size = 3, colour = "black")
   }
 
+  big   <- labs[!labs$small, , drop = FALSE]
+  small <- labs[labs$small, , drop = FALSE]
+  led   <- labs[labs$lead, , drop = FALSE]
+  # The leader runs from the band centre to just short of the floated label, so
+  # it connects the two without striking through the text.
+  if (nrow(led)) led$yend <- led$ymid + ifelse(led$by0 < led$ymid, -1, 1) * text_h * 0.45
   p +
     ggplot2::geom_text(
-      data = labs[!labs$outside, , drop = FALSE],
-      ggplot2::aes(x = .data$hour, y = .data$ymid, label = .data$label,
+      data = big,
+      ggplot2::aes(x = .data$tx, y = .data$ymid, label = .data$label,
                    colour = .data$colour, hjust = .data$hjust,
                    fontface = .data$face),
       size = 4.5
     ) +
-    ggplot2::geom_text(
-      data = labs[labs$outside, , drop = FALSE],
-      ggplot2::aes(x = .data$hour + 0.35, y = .data$ymid, label = .data$label,
-                   fontface = .data$face),
-      colour = "black", hjust = 0, size = 3.4
-    ) +
     ggplot2::geom_segment(
-      data = labs[labs$outside, , drop = FALSE],
-      ggplot2::aes(x = .data$hour + 0.30, xend = .data$hour,
-                   y = .data$ymid, yend = .data$ymid),
+      data = led,
+      ggplot2::aes(x = .data$bx, xend = .data$tx,
+                   y = .data$by0, yend = .data$yend),
       colour = "black", linewidth = 0.3
+    ) +
+    ggplot2::geom_text(
+      data = small,
+      ggplot2::aes(x = .data$tx, y = .data$ymid, label = .data$label,
+                   hjust = .data$hjust, fontface = .data$face),
+      colour = essp.colors("ink"), size = 3.6
     ) +
     ggplot2::scale_colour_identity(guide = "none") +
     ggplot2::scale_fill_manual(values = fills, guide = "none") +

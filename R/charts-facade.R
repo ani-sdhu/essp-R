@@ -84,6 +84,26 @@ essp_storage_season <- function(ba, year, mos) {
   tibble::as_tibble(ag[order(ag$hour), , drop = FALSE])
 }
 
+# Modelled battery profile -- the reference figure's raised-cosine wave, scaled
+# to this grid's peak. Discharge is concentrated in the evening ramp; charging
+# spreads across the solar-rich midday and carries ~1/RTE more energy. EIA's
+# hourly feed has no battery fuel type, so the house figure was always drawn
+# this way. Returned in the shape analyze.storagedisplace() expects.
+essp_storage_model <- function(data) {
+  tot  <- tapply(pmax(data$mean_mw, 0), data$hour, sum)
+  peak <- max(tot, na.rm = TRUE)
+  hrs  <- sort(unique(data$hour))
+  bump <- function(h, center, halfwidth, pk) {
+    o <- numeric(length(h)); w <- abs(h - center) < halfwidth
+    o[w] <- pk * 0.5 * (1 + cos(pi * (h[w] - center) / halfwidth)); o
+  }
+  dis <- 0.09 * peak
+  tibble::tibble(
+    hour         = hrs,
+    discharge_mw = bump(hrs, 19.5, 2.4, dis),
+    charge_mw    = bump(hrs, 12.3, 4.2, dis / 0.85))
+}
+
 #' Capacity-vs-generation bar from plain strings
 #'
 #' The signature figure, fetched and drawn in one call:
@@ -115,7 +135,9 @@ chart.generation <- function(resource = NULL, state = "US", year = NULL, ...) {
 
 # The string-argument path for chart.demandcurve(), dispatched from its guard.
 essp_demandcurve_strings <- function(tech, ba, year, season = "summer",
-                                     storage_ba = NULL, ...) {
+                                     storage_ba = NULL,
+                                     storage = c("auto", "model", "none"), ...) {
+  storage <- match.arg(storage)
   ba <- essp_parse_where(ba, need = "ba")
   if (length(ba) != 1L) rlang::abort("Give a single balancing-authority code, e.g. \"CISO\".")
   yr <- essp_parse_when(year, "year")$years
@@ -125,11 +147,20 @@ essp_demandcurve_strings <- function(tech, ba, year, season = "summer",
   fs <- essp_fuelshape_season(ba, yr, mos)
   gs <- analyze.gassplit(fs, ba = ba, year = yr)
 
-  sresp <- storage_ba %||% essp_storage_respondent(ba)
-  st <- tryCatch(essp_storage_season(sresp, yr, mos), error = function(e) NULL)
+  # Storage. "auto" tries the live BAT series (rare); "model" overlays the
+  # reference figure's raised-cosine battery profile (EIA's hourly feed has no
+  # battery fuel type, so the house figure was always modelled this way);
+  # "none" draws no storage.
+  st <- switch(storage,
+    none  = NULL,
+    model = essp_storage_model(gs),
+    auto  = tryCatch(essp_storage_season(storage_ba %||% essp_storage_respondent(ba), yr, mos),
+                     error = function(e) NULL))
   if (is.null(st) || !nrow(st)) {
-    message("No battery (BAT) series for \"", sresp,
-            "\"; drawing the curve without storage bands.")
+    if (storage == "auto") {
+      message("No live battery series; drawing the curve without storage bands ",
+              "(pass storage = \"model\" for the modelled overlay).")
+    }
     d <- gs
   } else {
     d <- analyze.storagedisplace(gs, st)
@@ -165,18 +196,29 @@ essp_demandcurve_strings <- function(tech, ba, year, season = "summer",
   # Grey every band and highlight the named resource(s) in their own house
   # colour. `tech` is one or more comma-separated resource NAMES ("Solar" or
   # "Solar,Wind"); map each to the EIA CODE the engine stacks by.
+  # tech = "ALL"/"none" means no highlight -- every fuel in its own house
+  # colour (the reference figure3 look). Otherwise map each named resource to
+  # the EIA code the engine stacks by.
   code_of <- c(Nuclear = "NUC", Coal = "COL", Solar = "SUN", Wind = "WND",
                Hydro = "WAT", "Natural Gas" = "NG", NGCC = "NGCC",
                NGCT = "NGCT", Storage = "Storage")
-  techs  <- trimws(strsplit(tech, ",")[[1]])
-  tcodes <- unname(code_of[techs])
-  tcodes[is.na(tcodes)] <- techs[is.na(tcodes)]
+  if (toupper(trimws(tech)) %in% c("ALL", "NONE", "")) {
+    tcodes <- NULL
+  } else {
+    techs  <- trimws(strsplit(tech, ",")[[1]])
+    tcodes <- unname(code_of[techs])
+    tcodes[is.na(tcodes)] <- techs[is.na(tcodes)]
+  }
 
   # Caller's ... (season/palette/etc.) can override any of these defaults.
-  # `highlight` drives both the fill (colour vs grey) and the bold labels.
+  # `highlight` drives both the fill (colour vs grey) and the bold labels. In
+  # the full-colour case (no highlight) match the reference figure's emphasis:
+  # Nuclear/Coal/Solar/Peakers bold, Wind italic.
   args <- utils::modifyList(
     list(mark_peak = TRUE, bands = bands, reserve_margin = reserve,
-         highlight = tcodes),
+         highlight = tcodes,
+         bold   = if (is.null(tcodes)) c("NUC", "COL", "SUN", "NGCT") else tcodes,
+         italic = if (is.null(tcodes)) "WND" else NULL),
     list(...))
   do.call(chart.demandcurve, c(list(d), args))
 }
