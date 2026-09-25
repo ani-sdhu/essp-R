@@ -369,33 +369,32 @@ chart.demandcurve <- function(data,
                         colour = essp.colors("ink"))
   }
 
-  # Hydro (WAT) and Other (OTH) fan into thin ribbons along the evening shoulder;
-  # in greyscale their on-band labels can't be told apart. Stack them in a
-  # right-anchored column in the open wedge above the DESCENDING shoulder, kept
-  # clear of whatever on-band label shares the right corner (chiefly NGCT), and
-  # lead each back to its band. Right-anchored so the text grows leftward and
-  # can't clip the panel edge; the higher band's label sits on top so the two
-  # leaders fan without crossing.
+  # Hydro (WAT) and Other (OTH) are thin bands whose on-band labels can't be told
+  # apart in greyscale. Label each near the right edge -- past the NGCT corner
+  # label, where the ribbons have fanned open -- with a short leader down onto the
+  # band, the same light touch as Wind. Right-anchored so the text can't clip the
+  # edge; de-collided so the pair never overlaps.
   ho <- labs[as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
   if (nrow(ho)) {
     labs <- labs[!as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
-    ho   <- ho[order(-ho$by0), , drop = FALSE]      # higher band's label on top
-    n    <- nrow(ho)
-    colx <- hmax - 0.2                              # right-anchored, just inside the panel
-    top  <- (if (!is.null(reserve_margin)) min(reserve_margin) else ymax_axis) - text_h * 0.7
-    corner <- labs[labs$tx > colx - 3.5, , drop = FALSE]   # on-band labels in the right corner
-    floor  <- if (nrow(corner)) max(corner$ymid) + text_h * 1.2 else top - text_h
-    gy   <- if (n > 1) max(text_h * 1.15, min(text_h * 1.4, (top - floor) / (n - 1))) else 0
-    ho$ly <- top - (seq_len(n) - 1L) * gy
-    for (i in seq_len(n)) {
+    colx <- hmax - 0.2
+    # Band centre at the right edge, where the leader lands.
+    ho$cy <- vapply(as.character(ho$fueltype), function(ft) {
+      bd <- stacked[as.character(stacked$fueltype) == ft, ]
+      stats::approx(bd$hour, bd$ymid, xout = colx, rule = 2)$y
+    }, numeric(1))
+    ho   <- ho[order(ho$cy), , drop = FALSE]         # lower band first
+    ho$ly <- ho$cy + text_h * 1.35                   # short lift above the band
+    for (k in seq_len(nrow(ho))[-1])                 # keep the pair from touching
+      if (ho$ly[k] - ho$ly[k - 1] < text_h * 1.15)
+        ho$ly[k] <- ho$ly[k - 1] + text_h * 1.15
+    for (i in seq_len(nrow(ho))) {
       p <- p +
-        ggplot2::annotate("segment", x = colx - 0.25, xend = ho$bx[i],
-                          y = ho$ly[i] - text_h * 0.45, yend = ho$by0[i] + text_h * 0.15,
-                          arrow = ggplot2::arrow(length = ggplot2::unit(0.15, "cm"),
-                                                 type = "closed"),
-                          colour = "black", linewidth = 0.35) +
+        ggplot2::annotate("segment", x = colx, xend = colx,
+                          y = ho$cy[i] + text_h * 0.15, yend = ho$ly[i] - text_h * 0.45,
+                          colour = "black", linewidth = 0.3) +
         ggplot2::annotate("text", x = colx, y = ho$ly[i], label = ho$label[i],
-                          size = 3.2, hjust = 1, colour = essp.colors("ink"))
+                          size = 3.6, hjust = 1, colour = essp.colors("ink"))
     }
   }
 
