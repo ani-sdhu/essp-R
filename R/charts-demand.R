@@ -17,7 +17,9 @@ smooth_band <- function(hour, value, out_hours, spar = 0.35) {
 # collision check converts through the panel's size. These are the measured
 # panel extents at the wide slot (11 x 6 in) the demand curve is published at;
 # without the tier brackets the right margin shrinks and the panel widens.
-dc_panel_pt <- function(has_bands) c(w = if (has_bands) 630 else 705, h = 401)
+dc_panel_pt <- function(has_bands, has_title = FALSE) {
+  c(w = if (has_bands) 630 else 705, h = if (has_title) 366 else 401)
+}
 
 # Approximate text box, in points, for a Merriweather label at ggplot size `s`
 # (mm). Widths were measured per glyph class: capitals run ~0.74 em, lower case
@@ -328,6 +330,9 @@ dc_place_labels <- function(stacked, levs, names_by_code, fills, bold, italic,
 #' @param italic Fuel codes whose labels are drawn italic.
 #' @param accent,semester,year As in [chart.fleetmakeup()].
 #' @param label_min Smallest share of peak, in percent, that still gets a label.
+#' @param title,subtitle Optional plot title and subtitle. Pass them here rather
+#'   than adding `labs()` afterwards: the label layout needs to know the panel
+#'   they leave.
 #'
 #' @return A ggplot object.
 #'
@@ -357,6 +362,8 @@ chart.demandcurve <- function(data,
                               semester       = "Fall",
                               storage_ba     = NULL,
                               storage        = "auto",
+                              title          = NULL,
+                              subtitle       = NULL,
                               year           = as.integer(format(Sys.Date(), "%Y"))) {
   # String front door: chart.demandcurve("Solar", "CISO", "2024", "summer").
   # A character first argument is the highlight tech, and the next positionals
@@ -365,6 +372,7 @@ chart.demandcurve <- function(data,
     return(essp_demandcurve_strings(
       tech = data, ba = highlight, year = order, season = bands %||% "summer",
       storage_ba = storage_ba, storage = storage, smooth = smooth,
+      title = title, subtitle = subtitle,
       palette = palette, semester = semester))
   }
 
@@ -472,7 +480,7 @@ chart.demandcurve <- function(data,
   # about a removed row instead of drawing it.
   headroom  <- if (isTRUE(mark_peak)) 1.16 else 1.06
   ymax_axis <- max(c(total$mw * headroom, reserve_margin))
-  # When a reserve band sits above the peak, the "Peak Demand" label is lifted
+  # When a reserve band sits above the peak, the "Peak Generation" label is lifted
   # clear of it -- so the axis has to reach past the label, or ggplot drops it
   # and the annotation silently disappears.
   if (isTRUE(mark_peak) && !is.null(reserve_margin)) {
@@ -489,7 +497,7 @@ chart.demandcurve <- function(data,
     # gets the label just beneath it instead, and the axis reaches down far
     # enough to hold it, rather than white text spilling over the axis.
     cmax <- max(charge$charge_mw)
-    lab_mw <- (ymax_axis + cmax * 1.25) * 11 / dc_panel_pt(!is.null(bands))[["h"]]
+    lab_mw <- (ymax_axis + cmax * 1.25) * 11 / dc_panel_pt(!is.null(bands), !is.null(title))[["h"]]
     charge_inside <- cmax >= 1.6 * lab_mw
     ymin_axis <- if (charge_inside) -cmax * 1.25 else -(cmax + 2.2 * lab_mw)
   }
@@ -502,7 +510,7 @@ chart.demandcurve <- function(data,
     # The label centres on noon unless the curve rises into the band there and
     # would paint over it; then it moves to the nearest stretch the curve
     # leaves clear.
-    rw <- dc_text_pt("Reserve Margin", 4.5)[["w"]] * 24 / dc_panel_pt(!is.null(bands))[["w"]]
+    rw <- dc_text_pt("Reserve Margin", 4.5)[["w"]] * 24 / dc_panel_pt(!is.null(bands), !is.null(title))[["w"]]
     rx <- seq(rw / 2 + 0.3, 24 - rw / 2 - 0.3, by = 0.1)
     clear_x <- rx[vapply(rx, function(x) {
       span <- total$hour >= x - rw / 2 - 0.2 & total$hour <= x + rw / 2 + 0.2
@@ -569,7 +577,7 @@ chart.demandcurve <- function(data,
 
   # Everything the band labels must keep clear of, as boxes in data units: the
   # reserve band (labels stay below it), the peak dot, its callout and arrow.
-  panel <- dc_panel_pt(!is.null(bands))
+  panel <- dc_panel_pt(!is.null(bands), !is.null(title))
   ux <- 24 / panel[["w"]]; uy <- (ymax_axis - ymin_axis) / panel[["h"]]
   obstacles <- list()
   segments  <- list()
@@ -596,11 +604,11 @@ chart.demandcurve <- function(data,
                                                type = "closed"),
                         colour = "black", linewidth = 0.5) +
       ggplot2::annotate("text", x = px + side * 2.3, y = py + lift,
-                        label = "Peak Demand", hjust = if (side < 0) 1 else 0,
+                        label = "Peak Generation", hjust = if (side < 0) 1 else 0,
                         size = 3, colour = "black")
     obstacles[[length(obstacles) + 1L]] <- c(x0 = px - 6 * ux, x1 = px + 6 * ux,
                                              y0 = py - 6 * uy, y1 = py + 6 * uy)
-    pk <- dc_text_pt("Peak Demand", 3)
+    pk <- dc_text_pt("Peak Generation", 3)
     lx0 <- if (side < 0) px + side * 2.3 - pk[["w"]] * ux else px + side * 2.3
     obstacles[[length(obstacles) + 1L]] <- c(x0 = lx0, x1 = lx0 + pk[["w"]] * ux,
                                              y0 = py + lift - pk[["h"]] * uy / 2,
@@ -663,7 +671,10 @@ chart.demandcurve <- function(data,
       labels = scales::comma, expand = c(0, 0),
       limits = c(ymin_axis, ymax_axis)) +
     ggplot2::coord_cartesian(xlim = c(0, 24), clip = "off") +
-    ggplot2::labs(x = NULL, y = "Demand (MW)") +
+    # The bands are generation. A grid's own demand differs from it by net
+    # interchange (PJM exports, California imports), so the axis says what is
+    # actually stacked.
+    ggplot2::labs(x = NULL, y = "Generation (MW)", title = title, subtitle = subtitle) +
     th +
     # The house figure is drawn on a bare canvas: no panel grid, no axis lines,
     # just tick labels and a rotated y title. Gridlines behind a filled stack

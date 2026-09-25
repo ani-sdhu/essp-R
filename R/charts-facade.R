@@ -220,5 +220,19 @@ essp_demandcurve_strings <- function(tech, ba, year, season = "summer",
          bold   = if (is.null(tcodes)) c("NUC", "COL", "SUN", "NGCT") else tcodes,
          italic = if (is.null(tcodes)) "WND" else NULL),
     list(...))
+  # Title the chart with the balancing authority whose data it draws, by the
+  # name it is registered under in EIA's hourly data, so a reader knows exactly
+  # which entity's grid this is.
+  who <- tryCatch({
+    r <- essp.respondents()
+    r$name[r$id == ba][1]
+  }, error = function(e) NA_character_)
+  who <- if (is.na(who) || !nzchar(who)) ba else paste0(who, " (", ba, ")")
+  span <- paste(month.abb[c(mos[1], mos[length(mos)])], collapse = " to ")
+  args <- utils::modifyList(
+    list(title = who,
+         subtitle = paste0("Average hourly generation by source, ", tolower(season), " ",
+                           yr, " (", span, ")")),
+    args)
   do.call(chart.demandcurve, c(list(d), args))
 }

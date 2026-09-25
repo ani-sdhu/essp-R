@@ -19,6 +19,9 @@ chart.demandcurve(
   label_min = 4,
   semester = "Fall",
   storage_ba = NULL,
+  storage = "auto",
+  title = NULL,
+  subtitle = NULL,
   year = as.integer(format(Sys.Date(), "\%Y"))
 )
 }
@@ -57,6 +60,10 @@ colour coding survives; under \code{"highlight"} the others go grey.}
 \item{accent, semester, year}{As in \code{\link[=chart.fleetmakeup]{chart.fleetmakeup()}}.}
 
 \item{label_min}{Smallest share of peak, in percent, that still gets a label.}
+
+\item{title, subtitle}{Optional plot title and subtitle. Pass them here rather
+than adding \code{labs()} afterwards: the label layout needs to know the panel
+they leave.}
 }
 \value{
 A ggplot object.
