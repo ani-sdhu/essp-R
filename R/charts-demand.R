@@ -11,6 +11,284 @@ smooth_band <- function(hour, value, out_hours, spar = 0.35) {
   pmax(v, 0)
 }
 
+# Label layout ----------------------------------------------------------------
+#
+# Labels are sized in points but positioned in data units (hours x MW), so every
+# collision check converts through the panel's size. These are the measured
+# panel extents at the wide slot (11 x 6 in) the demand curve is published at;
+# without the tier brackets the right margin shrinks and the panel widens.
+dc_panel_pt <- function(has_bands) c(w = if (has_bands) 630 else 705, h = 401)
+
+# Approximate text box, in points, for a Merriweather label at ggplot size `s`
+# (mm). Widths were measured per glyph class: capitals run ~0.74 em, lower case
+# ~0.54 em, and bold ~8% wider. Height is one em, which covers ascenders and
+# descenders.
+dc_text_pt <- function(label, s, face = "plain") {
+  em <- s * ggplot2::.pt
+  ch <- strsplit(label, "")[[1]]
+  w  <- sum(ifelse(grepl("[A-Z]", ch), 0.74, 0.54)) * em
+  if (face == "bold") w <- w * 1.08
+  c(w = w, h = em)
+}
+
+# Which rows of the box matrix `m` (columns x0, x1, y0, y1) does `b` overlap?
+dc_overlaps <- function(m, b) {
+  m[, "x0"] < b[["x1"]] & b[["x0"]] < m[, "x1"] & m[, "y0"] < b[["y1"]] & b[["y0"]] < m[, "y1"]
+}
+
+# Does the segment (x0, y0)-(x1, y1) pass through any box in `m`? Sampled along
+# its length, which is exact enough at label scale and handles any angle.
+dc_seg_hits <- function(x0, y0, x1, y1, m) {
+  if (!nrow(m)) return(FALSE)
+  t <- seq(0, 1, length.out = 30)
+  x <- x0 + (x1 - x0) * t; y <- y0 + (y1 - y0) * t
+  any(outer(x, m[, "x0"], ">") & outer(x, m[, "x1"], "<") &
+        outer(y, m[, "y0"], ">") & outer(y, m[, "y1"], "<"))
+}
+
+# Does segment p1-p2 properly cross any segment in the rows of `m`
+# (columns x0, y0, x1, y1)?
+dc_seg_cross <- function(p1, p2, m) {
+  if (!nrow(m)) return(FALSE)
+  orient <- function(ax, ay, bx, by, cx, cy) sign((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+  o1 <- orient(p1[1], p1[2], p2[1], p2[2], m[, 1], m[, 2])
+  o2 <- orient(p1[1], p1[2], p2[1], p2[2], m[, 3], m[, 4])
+  o3 <- orient(m[, 1], m[, 2], m[, 3], m[, 4], p1[1], p1[2])
+  o4 <- orient(m[, 1], m[, 2], m[, 3], m[, 4], p2[1], p2[2])
+  any(o1 * o2 < 0 & o3 * o4 < 0)
+}
+
+# Place every band label. Each band is first offered a spot ON the band, at the
+# widest stretch that holds the text clear of its edges, the threshold rules and
+# every label already placed; big bands choose first, so the large fuel-coloured
+# names land where the reader expects them. A band too thin to hold even the
+# small type anywhere is labelled in the white space above the curve, with a
+# leader that reaches it without crossing another label, leader or annotation.
+# Those few labels compete for the same scarce room under the reserve band, so
+# every order of placing them is tried and the arrangement with the shortest,
+# clearest leaders overall wins -- a greedy pass lets the first label take the
+# only open spot and pushes the rest across the chart. Returns one row per
+# label: text position and style, plus the leader (NA when on its band).
+dc_place_labels <- function(stacked, levs, names_by_code, fills, bold, italic,
+                            hmax, ymin_axis, ymax_axis, bands, obstacles,
+                            segments, ceiling_y, panel) {
+  ux <- 24 / panel[["w"]]                       # hours per point
+  uy <- (ymax_axis - ymin_axis) / panel[["h"]]  # MW per point
+  pad_x <- 4 * ux                               # breathing room, in data units
+  pad_y <- 2.5 * uy
+  edge  <- 12 * ux                              # keep text off the panel's ends
+  rule  <- 5 * uy                               # and off the dotted threshold rules
+
+  # `stacked` holds one block of rows per band, in `levs` order, over the same
+  # hours -- so each bound reshapes into an hours x bands matrix.
+  hours <- stacked$hour[stacked$fueltype == levs[1]]
+  lo_m  <- matrix(stacked$ymin,  nrow = length(hours), dimnames = list(NULL, levs))
+  hi_m  <- matrix(stacked$ymax,  nrow = length(hours), dimnames = list(NULL, levs))
+  val_m <- matrix(stacked$value, nrow = length(hours), dimnames = list(NULL, levs))
+  top   <- hi_m[, ncol(hi_m)]
+
+  box_m <- function(l) {
+    if (!length(l)) return(matrix(numeric(0), 0, 4, dimnames = list(NULL, c("x0", "x1", "y0", "y1"))))
+    do.call(rbind, lapply(l, function(b) b[c("x0", "x1", "y0", "y1")]))
+  }
+  seg_m <- function(l) if (length(l)) do.call(rbind, l) else matrix(numeric(0), 0, 4)
+
+  thick <- apply(val_m, 2, max)
+  todo  <- levs[thick > 0]
+  todo  <- todo[order(-thick[todo])]
+  face_of <- function(f) if (f %in% bold) "bold" else if (f %in% italic) "italic" else "plain"
+  clear_of_rules <- function(y0, y1) is.null(bands) || !any(unname(bands) > y0 - rule & unname(bands) < y1 + rule)
+  label_row <- function(f, x, y, size, colour, inside, ax = NA_real_, ay = NA_real_,
+                        lx = NA_real_, ly = NA_real_) {
+    data.frame(fueltype = f, label = unname(names_by_code[f]), x = x, y = y, size = size,
+               face = face_of(f), colour = colour, inside = inside,
+               ax = ax, ay = ay, lx = lx, ly = ly, stringsAsFactors = FALSE)
+  }
+
+  inside <- function(f, s, placed) {
+    lab <- unname(names_by_code[f])
+    tb <- dc_text_pt(lab, s, face_of(f)); w <- tb[["w"]] * ux; h <- tb[["h"]] * uy
+    # The label's centre of gravity: where the band carries most of its energy.
+    xc <- sum(hours * val_m[, f]) / sum(val_m[, f])
+    best <- NULL
+    for (x in seq(w / 2 + edge, hmax - w / 2 - edge, by = 0.05)) {
+      span <- hours >= x - w / 2 - pad_x & hours <= x + w / 2 + pad_x
+      lo <- max(lo_m[span, f]); hi <- min(hi_m[span, f])
+      room <- (hi - lo) - h - 2 * pad_y
+      if (room < 0) next
+      # Centre on the band, stepping off a threshold rule if one runs through.
+      for (y in unique(c((lo + hi) / 2, seq(lo + h / 2 + pad_y, hi - h / 2 - pad_y, length.out = 9)))) {
+        box <- c(x0 = x - w / 2, x1 = x + w / 2, y0 = y - h / 2, y1 = y + h / 2)
+        if (!clear_of_rules(box[["y0"]], box[["y1"]]) || any(dc_overlaps(placed, box))) next
+        # Favour roomy spots (capped, so a huge band does not drag its label to
+        # an edge), then spots near the band's centre of gravity.
+        score <- min(room / h, 1.5) - 0.04 * abs(x - xc) - 0.2 * abs(y - (lo + hi) / 2) / h
+        if (is.null(best) || score > best$score) best <- list(x = x, y = y, box = box, score = score)
+        break
+      }
+    }
+    if (is.null(best)) return(NULL)
+    row <- label_row(f, best$x, best$y, s, essp.textcolor(unname(fills[f])), TRUE)
+    # Registered with a margin, so no later leader grazes the text.
+    attr(row, "box") <- best$box + c(-pad_x, pad_x, -pad_y, pad_y)
+    row
+  }
+
+  # Candidate spots for a band's leadered label, best first: up to `k` spots
+  # at least half a label apart, so the arrangement search below has real
+  # alternatives to choose between.
+  outside <- function(f, placed, leaders, k = 4) {
+    lab <- unname(names_by_code[f])
+    tb <- dc_text_pt(lab, 3.6, face_of(f)); w <- tb[["w"]] * ux; h <- tb[["h"]] * uy
+    # Every free spot for the label in the white space above the curve, below
+    # the ceiling, off the threshold rules and clear of what is placed. Past
+    # the curve's end the strip up to the panel edge is open too, but only
+    # above the tier bracket, which fills that strip below the top rule.
+    xs <- seq(w / 2 + edge, 24 - w / 2 - pad_x, by = 0.2)
+    bracket_top <- if (is.null(bands)) -Inf else max(unname(bands)) + rule
+    spots <- do.call(rbind, lapply(xs, function(x) {
+      span <- hours >= x - w / 2 - pad_x & hours <= x + w / 2 + pad_x
+      y0 <- max(top[span]) + h / 2 + 2 * pad_y
+      if (x + w / 2 > hmax - edge) y0 <- max(y0, bracket_top + h / 2 + pad_y)
+      y1 <- min(y0 + 80 * uy, ceiling_y - pad_y - h / 2)
+      if (y1 < y0) return(NULL)
+      ys <- seq(y0, y1, by = h / 4)
+      cbind(x = x, y = ys)
+    }))
+    if (is.null(spots)) return(list())
+    # Side padding keeps two floated names from running together as one phrase.
+    bx <- cbind(x0 = spots[, "x"] - w / 2 - 1.5 * pad_x, x1 = spots[, "x"] + w / 2 + 1.5 * pad_x,
+                y0 = spots[, "y"] - h / 2 - pad_y,     y1 = spots[, "y"] + h / 2 + pad_y)
+    keep <- rep(TRUE, nrow(bx))
+    if (!is.null(bands)) {
+      for (r in unname(bands)) keep <- keep & !(r > bx[, "y0"] - rule & r < bx[, "y1"] + rule)
+    }
+    for (j in seq_len(nrow(placed))) {
+      keep <- keep & !(bx[, "x0"] < placed[j, "x1"] & placed[j, "x0"] < bx[, "x1"] &
+                         bx[, "y0"] < placed[j, "y1"] & placed[j, "y0"] < bx[, "y1"])
+    }
+    spots <- spots[keep, , drop = FALSE]; bx <- bx[keep, , drop = FALSE]
+    if (!nrow(spots)) return(list())
+
+    # Candidate tips: the band's midline wherever it is at least half as thick
+    # as it ever gets, so the arrowhead lands unmistakably inside it.
+    v <- val_m[, f]
+    ok <- which(v >= max(v) * 0.5 & hours >= 0.3 & hours <= hmax - 0.3)
+    # An arrowhead on a threshold rule is half hidden by it; keep tips off the
+    # rules wherever the band allows.
+    if (!is.null(bands)) {
+      mid <- (lo_m[ok, f] + hi_m[ok, f]) / 2
+      off <- vapply(mid, function(m) all(abs(unname(bands) - m) > rule), logical(1))
+      if (any(off)) ok <- ok[off]
+    }
+    ok <- ok[unique(round(seq(1, length(ok), length.out = min(length(ok), 24))))]
+    clear <- placed
+    if (nrow(clear)) clear <- clear + rep(c(-6 * ux, 6 * ux, -4 * uy, 4 * uy), each = nrow(clear))
+    pr <- expand.grid(s = seq_len(nrow(spots)), t = ok)
+    ax <- hours[pr$t]; ay <- (lo_m[cbind(pr$t, match(f, levs))] + hi_m[cbind(pr$t, match(f, levs))]) / 2
+    # The leader leaves the point of the label's box nearest its tip: the
+    # lower edge when the tip is below, the facing side when it is beside.
+    lx <- pmin(pmax(ax, bx[pr$s, "x0"]), bx[pr$s, "x1"])
+    ly <- pmin(pmax(ay, bx[pr$s, "y0"]), bx[pr$s, "y1"])
+    len <- sqrt(((lx - ax) / ux)^2 + ((ly - ay) / uy)^2)   # points
+    # Short leaders read best: past 60 pt every extra point costs triple. A
+    # tip on a thinner stretch of the band costs more, since the arrowhead
+    # must land unmistakably inside it.
+    cheap <- len + 2 * pmax(0, len - 60) + 40 * (1 - v[pr$t] / max(v))
+    cand <- order(cheap)
+    cand <- cand[len[cand] <= 200]
+
+    found <- list()
+    for (i in cand) {
+      if (length(found) >= k) break
+      b <- bx[pr$s[i], ]
+      # Distinct alternatives only: skip spots within half a label of one kept.
+      sx <- spots[pr$s[i], "x"]; sy <- spots[pr$s[i], "y"]
+      if (length(found) && any(vapply(found, function(r) abs(r$x - sx) < w / 2 && abs(r$y - sy) < h / 2,
+                                      logical(1)))) next
+      # Leaders keep a clear margin from every other label, so none reads as
+      # belonging to the name it passes.
+      if (dc_seg_hits(lx[i], ly[i], ax[i], ay[i], clear)) next
+      if (dc_seg_cross(c(lx[i], ly[i]), c(ax[i], ay[i]), leaders)) next
+      # A leader should travel through white space and cross other bands only
+      # briefly on its way in -- one that runs along inside a neighbour reads
+      # as pointing at it -- so distance spent inside other bands costs extra,
+      # as does each band crossed.
+      ts <- seq(0.02, 0.98, length.out = 25)
+      hi_i <- findInterval(lx[i] + (ax[i] - lx[i]) * ts, hours, all.inside = TRUE)
+      py <- ly[i] + (ay[i] - ly[i]) * ts
+      hit <- lo_m[hi_i, , drop = FALSE] <= py & hi_m[hi_i, , drop = FALSE] >= py &
+        val_m[hi_i, , drop = FALSE] > 0
+      hit[, f] <- FALSE
+      cost <- cheap[i] + 1.5 * len[i] * mean(rowSums(hit) > 0) + 8 * sum(colSums(hit) > 0)
+      row <- label_row(f, spots[pr$s[i], "x"], spots[pr$s[i], "y"], 3.6, essp.colors("ink"),
+                       FALSE, ax[i], ay[i], lx[i], ly[i])
+      attr(row, "box") <- b
+      attr(row, "cost") <- cost
+      found[[length(found) + 1L]] <- row
+    }
+    found[order(vapply(found, attr, numeric(1), "cost"))]
+  }
+
+  # Pass 1: on-band labels, big type then small, thickest bands first.
+  placed <- obstacles
+  out <- list()
+  pending <- character(0)
+  for (f in todo) {
+    pm <- box_m(placed)
+    row <- inside(f, 4.5, pm)
+    if (is.null(row)) row <- inside(f, 3.6, pm)
+    if (is.null(row)) {
+      pending <- c(pending, f)
+    } else {
+      placed[[length(placed) + 1L]] <- attr(row, "box")
+      out[[length(out) + 1L]] <- row
+    }
+  }
+
+  # Pass 2: leadered labels. Search orders and each label's alternative spots
+  # depth-first, pruning any branch already dearer than the best complete
+  # arrangement found.
+  best_cost <- Inf
+  arrange <- function(remaining, placed, leaders, so_far) {
+    if (!length(remaining)) {
+      best_cost <<- min(best_cost, so_far)
+      return(list(rows = list(), cost = 0))
+    }
+    best <- NULL
+    # Beyond a handful of labels, keep the thickest-first order and one spot
+    # each, so the search stays quick.
+    many <- length(remaining) > 4
+    for (f in if (many) remaining[1] else remaining) {
+      for (row in outside(f, box_m(placed), seg_m(leaders), k = if (many) 1 else 4)) {
+        c1 <- so_far + attr(row, "cost")
+        if (c1 >= best_cost) next
+        rest <- arrange(setdiff(remaining, f),
+                        c(placed, list(attr(row, "box"))),
+                        c(leaders, list(c(row$lx, row$ly, row$ax, row$ay))), c1)
+        if (is.null(rest)) next
+        cost <- attr(row, "cost") + rest$cost
+        if (is.null(best) || cost < best$cost) best <- list(rows = c(list(row), rest$rows), cost = cost)
+      }
+    }
+    best
+  }
+  if (length(pending)) {
+    res <- arrange(pending, placed, segments, 0)
+    if (!is.null(res)) {
+      out <- c(out, res$rows)
+    } else {
+      # Never drop a name: as a last resort, label the band where it is thickest.
+      for (f in pending) {
+        i <- which.max(val_m[, f])
+        out[[length(out) + 1L]] <- label_row(f, hours[i], (lo_m[i, f] + hi_m[i, f]) / 2, 3.6,
+                                             essp.colors("ink"), TRUE)
+      }
+    }
+  }
+  do.call(rbind, lapply(out, function(r) { attributes(r)[c("box", "cost")] <- NULL; r }))
+}
+
 #' Daily demand curve, stacked by fuel
 #'
 #' Average generation by hour of day, stacked bottom-to-top in dispatch order,
@@ -186,32 +464,9 @@ chart.demandcurve <- function(data,
   total <- data.frame(hour = hours_out, mw = cum[, ncol(cum)])
   peak_i <- which.max(total$mw)
 
-  # Label each band at its thickest point, where the text has the most room.
-  # Two bands need their anchor overridden: Nuclear is near-constant baseload,
-  # so its thickest point is an arbitrary hour (usually the far left) -- pin it
-  # to mid-day so the label sits centred over the band. Hydro is a thin band
-  # that peaks at the right edge, where its label clips off the panel -- keep
-  # its anchor inside the interior so it stays fully drawn.
-  anchor_hour <- c(NUC = 12)   # centre the label at this hour
-  interior    <- c(WAT = 20.5) # cap the anchor hour at this, pulling it inward
-  labs <- do.call(rbind, lapply(split(stacked, stacked$fueltype), function(d) {
-    if (!nrow(d) || all(d$value <= 0)) return(NULL)
-    ft <- as.character(d$fueltype[1])
-    if (ft %in% names(anchor_hour)) {
-      d[which.min(abs(d$hour - anchor_hour[[ft]])), , drop = FALSE]
-    } else if (ft %in% names(interior) && d$hour[which.max(d$value)] > interior[[ft]]) {
-      cand <- d[d$hour <= interior[[ft]], , drop = FALSE]
-      cand[which.max(cand$value), , drop = FALSE]
-    } else {
-      d[which.max(d$value), , drop = FALSE]
-    }
-  }))
-  labs$label <- unname(names_by_code[as.character(labs$fueltype)])
-  # Every band that is visible at all gets named. A band too thin to hold text
-  # is labelled outside with a leader rather than dropped -- an unlabelled
-  # colour is unreadable, and silently omitting it hides real generation.
   # The peak marker's label sits above the peak, so the axis has to leave room
-  # for it. Computed here because the label placement below depends on it.
+  # for it -- otherwise ggplot drops the annotation outside the scale and warns
+  # about a removed row instead of drawing it.
   headroom  <- if (isTRUE(mark_peak)) 1.16 else 1.06
   ymax_axis <- max(c(total$mw * headroom, reserve_margin))
   # When a reserve band sits above the peak, the "Peak Demand" label is lifted
@@ -220,69 +475,6 @@ chart.demandcurve <- function(data,
   if (isTRUE(mark_peak) && !is.null(reserve_margin)) {
     ymax_axis <- max(ymax_axis, max(reserve_margin) * 1.075)
   }
-
-  labs <- labs[labs$value > 0, , drop = FALSE]
-  # A size-4.5 label occupies roughly 4.5% of the panel height.
-  text_h <- ymax_axis * 0.045
-  # Remember each band's true anchor before any nudging: the label may be pushed
-  # off its slab to avoid a collision, and a leader has to point back to where
-  # the band actually is, not to the shifted label.
-  labs$bx  <- labs$hour        # anchor hour, on the band
-  labs$by0 <- labs$ymid        # anchor height, centre of the band
-  labs$outside <- labs$value < text_h
-
-  # Nudge any inside label that would land on a threshold rule first, so the
-  # de-collision below settles on the final positions.
-  if (!is.null(bands)) {
-    for (b in unname(bands)) {
-      hit <- !labs$outside & abs(labs$ymid - b) < text_h * 0.6
-      labs$ymid[hit] <- labs$ymid[hit] +
-        ifelse(labs$ymid[hit] >= b, 1, -1) * text_h * 0.75
-    }
-  }
-
-  # De-collide EVERY label vertically, not just the thin outside ones. On grids
-  # with many small evening bands (NGCT, Other, Hydro, Wind, Storage all peaking
-  # together) the inside labels pile into the top-right corner too. Walk bottom
-  # to top pushing each clear, then, if that runs past the top of the panel,
-  # walk back down from a capped top so nothing is shoved off the axis.
-  g <- text_h * 1.08
-  ord <- order(labs$ymid)
-  for (k in seq_along(ord)[-1]) {
-    if (labs$ymid[ord[k]] - labs$ymid[ord[k - 1]] < g)
-      labs$ymid[ord[k]] <- labs$ymid[ord[k - 1]] + g
-  }
-  cap <- ymax_axis - text_h * 0.6
-  top <- ord[length(ord)]
-  if (labs$ymid[top] > cap) {
-    labs$ymid[top] <- cap
-    for (k in rev(seq_along(ord))[-1]) {
-      if (labs$ymid[ord[k + 1]] - labs$ymid[ord[k]] < g)
-        labs$ymid[ord[k]] <- labs$ymid[ord[k + 1]] - g
-    }
-  }
-
-  # Only a label the de-collision actually pushed off its slab gets a leader
-  # back to the band centre; a thin band whose label still sits on it needs no
-  # connector (a stub floating beside an on-band label just looks like noise).
-  labs$lead <- abs(labs$ymid - labs$by0) > text_h * 0.55
-  # Thin slabs and floated labels take the smaller ink type, as the house figure
-  # sets Hydro and Storage; thick bands keep the large fuel-coloured label.
-  labs$small <- labs$outside | labs$lead
-
-  labs$colour <- essp.textcolor(unname(fills[as.character(labs$fueltype)]))
-  labs$face <- ifelse(as.character(labs$fueltype) %in% bold, "bold",
-                      ifelse(as.character(labs$fueltype) %in% italic, "italic", "plain"))
-  # Alignment keeps every label inside the panel: left-anchored at the start of
-  # the day, right-anchored near its end (the text then grows leftward, away
-  # from the axis), centred in between. The right-anchored x is pinned just
-  # inside the panel so even a label anchored at the far edge cannot clip.
-  labs$hjust <- ifelse(labs$bx <= 1.5, 0, ifelse(labs$bx >= 16.5, 1, 0.5))
-  labs$tx <- ifelse(labs$hjust == 1, pmin(labs$bx, hmax - 0.2), labs$bx)
-
-  # The peak marker's label sits above the peak, so the axis has to leave
-  # room for it -- otherwise ggplot drops the annotation outside the scale
-  # and warns about a removed row instead of drawing it.
 
   # Charging is the battery acting as load. It belongs below the axis: drawing
   # it as a band in the stack would overstate generation by the charging energy.
@@ -294,6 +486,16 @@ chart.demandcurve <- function(data,
   # Reserve margin sits behind the stack so the bands stay readable over it.
   if (!is.null(reserve_margin)) {
     if (length(reserve_margin) != 2) rlang::abort("`reserve_margin` must be length 2.")
+    # The label centres on noon unless the curve rises into the band there and
+    # would paint over it; then it moves to the nearest stretch the curve
+    # leaves clear.
+    rw <- dc_text_pt("Reserve Margin", 4.5)[["w"]] * 24 / dc_panel_pt(!is.null(bands))[["w"]]
+    rx <- seq(rw / 2 + 0.3, 24 - rw / 2 - 0.3, by = 0.1)
+    clear_x <- rx[vapply(rx, function(x) {
+      span <- total$hour >= x - rw / 2 - 0.2 & total$hour <= x + rw / 2 + 0.2
+      !any(total$mw[span] > min(reserve_margin))
+    }, logical(1))]
+    rm_x <- if (length(clear_x)) clear_x[which.min(abs(clear_x - 12))] else 12
     p <- p +
       ggplot2::annotate("rect", xmin = -Inf, xmax = Inf,
                         ymin = min(reserve_margin), ymax = max(reserve_margin),
@@ -301,7 +503,7 @@ chart.demandcurve <- function(data,
       ggplot2::annotate("segment", x = -Inf, xend = Inf,
                         y = reserve_margin, yend = reserve_margin,
                         linetype = "dashed", colour = "#C0392B", linewidth = 0.6) +
-      ggplot2::annotate("text", x = 12, y = mean(reserve_margin),
+      ggplot2::annotate("text", x = rm_x, y = mean(reserve_margin),
                         label = "Reserve Margin", colour = "#C0392B",
                         fontface = "italic", size = 4.5)
   }
@@ -351,53 +553,13 @@ chart.demandcurve <- function(data,
     }
   }
 
-  # Storage discharge is a thin slab at the crest. Label it just above the peak
-  # with a short leader onto the sliver, the way the house figure does -- kept
-  # separate from the Hydro/Other column so neither crowds the other.
-  st <- labs[as.character(labs$fueltype) %in% c("Storage", "BAT"), , drop = FALSE]
-  if (nrow(st)) {
-    labs <- labs[!as.character(labs$fueltype) %in% c("Storage", "BAT"), , drop = FALSE]
-    sx <- st$bx[1]; sy <- st$by0[1]
-    p <- p +
-      ggplot2::annotate("segment", x = min(sx + 1.8, 22.4), xend = sx + 0.1,
-                        y = sy + ymax_axis * 0.085, yend = sy + ymax_axis * 0.008,
-                        arrow = ggplot2::arrow(length = ggplot2::unit(0.18, "cm"),
-                                               type = "closed"),
-                        colour = "black", linewidth = 0.45) +
-      ggplot2::annotate("text", x = min(sx + 2.0, 22.6), y = sy + ymax_axis * 0.105,
-                        label = "Storage", size = 3.2, hjust = 0.5,
-                        colour = essp.colors("ink"))
-  }
-
-  # Hydro (WAT) and Other (OTH) fan into thin ribbons along the evening shoulder;
-  # in greyscale their on-band labels can't be told apart. Stack them in a
-  # right-anchored column in the open wedge above the DESCENDING shoulder, kept
-  # clear of whatever on-band label shares the right corner (chiefly NGCT), and
-  # lead each back to its band. Right-anchored so the text grows leftward and
-  # can't clip the panel edge; the higher band's label sits on top so the two
-  # leaders fan without crossing.
-  ho <- labs[as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
-  if (nrow(ho)) {
-    labs <- labs[!as.character(labs$fueltype) %in% c("WAT", "OTH"), , drop = FALSE]
-    ho   <- ho[order(-ho$by0), , drop = FALSE]      # higher band's label on top
-    n    <- nrow(ho)
-    colx <- hmax - 0.2                              # right-anchored, just inside the panel
-    top  <- (if (!is.null(reserve_margin)) min(reserve_margin) else ymax_axis) - text_h * 0.7
-    corner <- labs[labs$tx > colx - 3.5, , drop = FALSE]   # on-band labels in the right corner
-    floor  <- if (nrow(corner)) max(corner$ymid) + text_h * 1.2 else top - text_h
-    gy   <- if (n > 1) max(text_h * 1.15, min(text_h * 1.4, (top - floor) / (n - 1))) else 0
-    ho$ly <- top - (seq_len(n) - 1L) * gy
-    for (i in seq_len(n)) {
-      p <- p +
-        ggplot2::annotate("segment", x = colx - 0.25, xend = ho$bx[i],
-                          y = ho$ly[i] - text_h * 0.45, yend = ho$by0[i] + text_h * 0.15,
-                          arrow = ggplot2::arrow(length = ggplot2::unit(0.15, "cm"),
-                                                 type = "closed"),
-                          colour = "black", linewidth = 0.35) +
-        ggplot2::annotate("text", x = colx, y = ho$ly[i], label = ho$label[i],
-                          size = 3.2, hjust = 1, colour = essp.colors("ink"))
-    }
-  }
+  # Everything the band labels must keep clear of, as boxes in data units: the
+  # reserve band (labels stay below it), the peak dot, its callout and arrow.
+  panel <- dc_panel_pt(!is.null(bands))
+  ux <- 24 / panel[["w"]]; uy <- (ymax_axis - ymin_axis) / panel[["h"]]
+  obstacles <- list()
+  segments  <- list()
+  ceiling_y <- if (!is.null(reserve_margin)) min(reserve_margin) else ymax_axis
 
   if (isTRUE(mark_peak)) {
     px <- total$hour[peak_i]; py <- total$mw[peak_i]
@@ -411,45 +573,63 @@ chart.demandcurve <- function(data,
     } else {
       ymax_axis * 0.095
     }
+    ax0 <- px + side * 2.2; ay0 <- py + lift * 0.88
+    ax1 <- px + side * 0.25; ay1 <- py + ymax_axis * 0.010
     p <- p +
       ggplot2::annotate("point", x = px, y = py, colour = "#C00000", size = 2.4) +
-      ggplot2::annotate("segment",
-                        x = px + side * 2.2, xend = px + side * 0.25,
-                        y = py + lift * 0.88, yend = py + ymax_axis * 0.010,
+      ggplot2::annotate("segment", x = ax0, xend = ax1, y = ay0, yend = ay1,
                         arrow = ggplot2::arrow(length = ggplot2::unit(0.2, "cm"),
                                                type = "closed"),
                         colour = "black", linewidth = 0.5) +
       ggplot2::annotate("text", x = px + side * 2.3, y = py + lift,
                         label = "Peak Demand", hjust = if (side < 0) 1 else 0,
                         size = 3, colour = "black")
+    obstacles[[length(obstacles) + 1L]] <- c(x0 = px - 6 * ux, x1 = px + 6 * ux,
+                                             y0 = py - 6 * uy, y1 = py + 6 * uy)
+    pk <- dc_text_pt("Peak Demand", 3)
+    lx0 <- if (side < 0) px + side * 2.3 - pk[["w"]] * ux else px + side * 2.3
+    obstacles[[length(obstacles) + 1L]] <- c(x0 = lx0, x1 = lx0 + pk[["w"]] * ux,
+                                             y0 = py + lift - pk[["h"]] * uy / 2,
+                                             y1 = py + lift + pk[["h"]] * uy / 2)
+    # The callout arrow, as a chain of small boxes, so no label sits on it.
+    for (t in seq(0, 1, length.out = 12)) {
+      x <- ax0 + (ax1 - ax0) * t; y <- ay0 + (ay1 - ay0) * t
+      obstacles[[length(obstacles) + 1L]] <- c(x0 = x - 3 * ux, x1 = x + 3 * ux,
+                                               y0 = y - 3 * uy, y1 = y + 3 * uy)
+    }
+    segments[[length(segments) + 1L]] <- c(ax0, ay0, ax1, ay1)
   }
 
-  big   <- labs[!labs$small, , drop = FALSE]
-  small <- labs[labs$small, , drop = FALSE]
-  led   <- labs[labs$lead, , drop = FALSE]
-  # The leader runs from the band centre to just short of the floated label, so
-  # it connects the two without striking through the text.
-  if (nrow(led)) led$yend <- led$ymid + ifelse(led$by0 < led$ymid, -1, 1) * text_h * 0.45
+  labs <- dc_place_labels(stacked, levs, names_by_code, fills, bold, italic,
+                          hmax, ymin_axis, ymax_axis, bands, obstacles,
+                          segments, ceiling_y, panel)
+  on_band <- labs[labs$inside, , drop = FALSE]
+  led     <- labs[!labs$inside, , drop = FALSE]
+
+  p <- p +
+    ggplot2::geom_text(
+      data = on_band,
+      ggplot2::aes(x = .data$x, y = .data$y, label = .data$label,
+                   colour = .data$colour, fontface = .data$face, size = .data$size)
+    ) +
+    ggplot2::scale_size_identity()
+  if (nrow(led)) {
+    p <- p +
+      ggplot2::geom_segment(
+        data = led,
+        ggplot2::aes(x = .data$lx, xend = .data$ax, y = .data$ly, yend = .data$ay),
+        arrow = ggplot2::arrow(length = ggplot2::unit(0.14, "cm"), type = "closed"),
+        colour = "black", linewidth = 0.35
+      ) +
+      ggplot2::geom_text(
+        data = led,
+        ggplot2::aes(x = .data$x, y = .data$y, label = .data$label,
+                     fontface = .data$face),
+        colour = essp.colors("ink"), size = 3.6
+      )
+  }
+
   p +
-    ggplot2::geom_text(
-      data = big,
-      ggplot2::aes(x = .data$tx, y = .data$ymid, label = .data$label,
-                   colour = .data$colour, hjust = .data$hjust,
-                   fontface = .data$face),
-      size = 4.5
-    ) +
-    ggplot2::geom_segment(
-      data = led,
-      ggplot2::aes(x = .data$bx, xend = .data$tx,
-                   y = .data$by0, yend = .data$yend),
-      colour = "black", linewidth = 0.3
-    ) +
-    ggplot2::geom_text(
-      data = small,
-      ggplot2::aes(x = .data$tx, y = .data$ymid, label = .data$label,
-                   hjust = .data$hjust, fontface = .data$face),
-      colour = essp.colors("ink"), size = 3.6
-    ) +
     ggplot2::scale_colour_identity(guide = "none") +
     ggplot2::scale_fill_manual(values = fills, guide = "none") +
     ggplot2::scale_x_continuous(
