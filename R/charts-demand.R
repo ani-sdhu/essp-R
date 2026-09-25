@@ -108,16 +108,19 @@ dc_place_labels <- function(stacked, levs, names_by_code, fills, bold, italic,
   inside <- function(f, s, placed) {
     lab <- unname(names_by_code[f])
     tb <- dc_text_pt(lab, s, face_of(f)); w <- tb[["w"]] * ux; h <- tb[["h"]] * uy
+    # The em box already carries some internal leading, so the small type
+    # needs less margin to the band's edges than the large.
+    pin <- if (s < 4) 1.5 * uy else pad_y
     # The label's centre of gravity: where the band carries most of its energy.
     xc <- sum(hours * val_m[, f]) / sum(val_m[, f])
     best <- NULL
     for (x in seq(w / 2 + edge, hmax - w / 2 - edge, by = 0.05)) {
       span <- hours >= x - w / 2 - pad_x & hours <= x + w / 2 + pad_x
       lo <- max(lo_m[span, f]); hi <- min(hi_m[span, f])
-      room <- (hi - lo) - h - 2 * pad_y
+      room <- (hi - lo) - h - 2 * pin
       if (room < 0) next
       # Centre on the band, stepping off a threshold rule if one runs through.
-      for (y in unique(c((lo + hi) / 2, seq(lo + h / 2 + pad_y, hi - h / 2 - pad_y, length.out = 9)))) {
+      for (y in unique(c((lo + hi) / 2, seq(lo + h / 2 + pin, hi - h / 2 - pin, length.out = 9)))) {
         box <- c(x0 = x - w / 2, x1 = x + w / 2, y0 = y - h / 2, y1 = y + h / 2)
         if (!clear_of_rules(box[["y0"]], box[["y1"]]) || any(dc_overlaps(placed, box))) next
         # Favour roomy spots (capped, so a huge band does not drag its label to
@@ -479,7 +482,17 @@ chart.demandcurve <- function(data,
   # Charging is the battery acting as load. It belongs below the axis: drawing
   # it as a band in the stack would overstate generation by the charging energy.
   charge <- attr(data, "essp_charge")
-  ymin_axis <- if (!is.null(charge)) -max(charge$charge_mw) * 1.25 else 0
+  ymin_axis <- 0
+  if (!is.null(charge)) {
+    # Its label sits inside the ribbon when the ribbon is deep enough to hold
+    # it (about 11 pt with margins). A shallow one -- a small battery fleet --
+    # gets the label just beneath it instead, and the axis reaches down far
+    # enough to hold it, rather than white text spilling over the axis.
+    cmax <- max(charge$charge_mw)
+    lab_mw <- (ymax_axis + cmax * 1.25) * 11 / dc_panel_pt(!is.null(bands))[["h"]]
+    charge_inside <- cmax >= 1.6 * lab_mw
+    ymin_axis <- if (charge_inside) -cmax * 1.25 else -(cmax + 2.2 * lab_mw)
+  }
 
   p <- ggplot2::ggplot()
 
@@ -517,8 +530,9 @@ chart.demandcurve <- function(data,
       ggplot2::geom_hline(yintercept = 0, colour = essp.colors("ugablack"),
                           linewidth = 0.5) +
       ggplot2::annotate("text", x = charge$hour[which.max(charge$charge_mw)],
-                        y = -max(charge$charge_mw) / 2, label = "Storage charging",
-                        size = 2.9, fontface = "bold", colour = "#FFFFFF")
+                        y = if (charge_inside) -cmax / 2 else -cmax - 1.1 * lab_mw,
+                        label = "Storage charging", size = 2.9, fontface = "bold",
+                        colour = if (charge_inside) "#FFFFFF" else essp.colors("ink"))
   }
 
   p <- p +
